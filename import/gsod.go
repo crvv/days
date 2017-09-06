@@ -21,6 +21,36 @@ import (
 const DATA_DIR = "data"
 const THREADS = 8
 
+const ddl = `CREATE TABLE gsod (
+    station_id        TEXT NOT NULL,
+    record_date       DATE NOT NULL,
+    mean_temperature  REAL,
+    max_temperature   REAL,
+    min_temperature   REAL,
+    mean_dew_point    REAL,
+    mean_sea_pressure REAL,
+    mean_pressure     REAL,
+    mean_visibility   REAL,
+    mean_wind_speed   REAL,
+    precipitation     REAL
+);
+
+CREATE TABLE gsod_availability (
+    station_id        TEXT     NOT NULL,
+    year              SMALLINT NOT NULL,
+    mean_temperature  SMALLINT,
+    max_temperature   SMALLINT,
+    min_temperature   SMALLINT,
+    mean_dew_point    SMALLINT,
+    mean_sea_pressure SMALLINT,
+    mean_pressure     SMALLINT,
+    mean_visibility   SMALLINT,
+    mean_wind_speed   SMALLINT,
+    precipitation     SMALLINT,
+    count             SMALLINT,
+    PRIMARY KEY (station_id, year)
+);`
+
 func init() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 }
@@ -42,6 +72,10 @@ func connect() *pgx.ConnPool {
 func main() {
 	pgConn = connect()
 	defer pgConn.Close()
+	_, err := pgConn.Exec(ddl)
+	if err != nil {
+		panic(err)
+	}
 
 	var wg sync.WaitGroup
 	filesChan := make(chan File, 128)

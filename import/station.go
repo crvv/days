@@ -22,6 +22,16 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	_, err = tx.Exec(`CREATE TABLE stations (
+    id         TEXT PRIMARY KEY,
+    name       TEXT,
+    country    TEXT,
+    icao       TEXT,
+    coordinate POINT,
+    elevation  REAL)`)
+	if err != nil {
+		panic(err)
+	}
 	data, err := ioutil.ReadFile(STATIONS_FILE)
 	if err != nil {
 		panic(err)
@@ -45,6 +55,12 @@ func main() {
 		longitude := strings.TrimSpace(line[65:74])
 		elevation := strings.TrimSpace(line[74:82])
 		insert(tx, id, name, country, icao, latitude, longitude, elevation)
+	}
+	_, err = tx.Exec(`CREATE INDEX ON stations (icao);
+CREATE INDEX ON stations (name);
+CREATE INDEX ON stations USING GIST (coordinate);`)
+	if err != nil {
+		panic(err)
 	}
 	err = tx.Commit()
 	if err != nil {

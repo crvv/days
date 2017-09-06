@@ -73,6 +73,20 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	_, err = tx.Exec(`CREATE TABLE cities (
+    id              BIGINT PRIMARY KEY,
+    station_id      TEXT,
+    name            TEXT   NOT NULL,
+    country         TEXT   NOT NULL,
+    alternate_names JSONB  NOT NULL,
+    link            JSONB  NOT NULL,
+    coordinate      POINT,
+    elevation       REAL   NOT NULL,
+    population      BIGINT NOT NULL,
+    timezone        TEXT   NOT NULL)`)
+	if err != nil {
+		panic(err)
+	}
 	z, err := zip.OpenReader(CITIES_FILE)
 	if err != nil {
 		panic(err)
@@ -109,6 +123,13 @@ func main() {
 			continue
 		}
 		insert(tx, id, name, latitude, longitude, country, population, elevation, timezone, alternateNames, link)
+	}
+	_, err = tx.Exec(`CREATE INDEX ON cities (station_id);
+CREATE INDEX ON cities (name);
+CREATE INDEX ON cities USING GIN (alternate_names jsonb_path_ops);
+CREATE INDEX ON cities USING GIST (coordinate);`)
+	if err != nil {
+		panic(err)
 	}
 	err = tx.Commit()
 	if err != nil {
