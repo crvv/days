@@ -45,9 +45,6 @@ func makeSlice(fields []pgx.FieldDescription) (result []interface{}) {
 		case "text":
 			var v string
 			result = append(result, &v)
-		case "jsonb":
-			var v interface{}
-			result = append(result, &v)
 		case "float4", "float8":
 			var v float32
 			result = append(result, &v)
@@ -55,7 +52,8 @@ func makeSlice(fields []pgx.FieldDescription) (result []interface{}) {
 			var v int64
 			result = append(result, &v)
 		default:
-			panic(field.DataTypeName)
+			var v interface{}
+			result = append(result, &v)
 		}
 	}
 	return
