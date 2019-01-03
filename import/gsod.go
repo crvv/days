@@ -4,38 +4,71 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"github.com/jackc/pgx"
+	"flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
+
+	"github.com/crvv/days/import/utility"
+	"github.com/jackc/pgx"
 )
 
-// for year in `seq 1997 2016`;do wget ftp://ftp.ncdc.noaa.gov/pub/data/gsod/$year/gsod_$year.tar ; done
-const DATA_DIR = "data"
-const THREADS = 8
+type File struct {
+	name string
+	data []byte
+}
 
-const ddl = `CREATE TABLE gsod (
-    station_id        TEXT NOT NULL,
-    record_date       DATE NOT NULL,
-    mean_temperature  REAL,
-    max_temperature   REAL,
-    min_temperature   REAL,
-    mean_dew_point    REAL,
-    mean_sea_pressure REAL,
-    mean_pressure     REAL,
-    mean_visibility   REAL,
-    mean_wind_speed   REAL,
-    precipitation     REAL
-);
+func main() {
+	dataDir := flag.String("data", "data", "where to store gsod data")
+	year := flag.Int("year", 1997, "which year will be import")
+	flag.Parse()
+	url := fmt.Sprintf("ftp://ftp.ncdc.noaa.gov/pub/data/gsod/%[1]v/gsod_%[1]v.tar", *year)
+	data := utility.Download(url)
 
-CREATE TABLE gsod_availability (
+	fileChan := make(chan File)
+	go getFiles(data, fileChan)
+	saveGSOD(fileChan, *dataDir)
+}
+
+func getFiles(data []byte, output chan File) {
+	tarReader := tar.NewReader(bytes.NewReader(data))
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			close(output)
+			return
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !strings.HasSuffix(header.Name, ".gz") {
+			continue
+		}
+		name := filepath.Base(header.Name)
+		name = name[:len(name)-3]
+		gzReader, err := gzip.NewReader(tarReader)
+		if err != nil {
+			log.Fatal(err)
+		}
+		data, err := ioutil.ReadAll(gzReader)
+		if err != nil {
+			log.Fatal(err)
+		}
+		output <- File{
+			name: name,
+			data: data,
+		}
+	}
+}
+
+const GSODTableSQL = `
+CREATE TABLE IF NOT EXISTS gsod_availability (
     station_id        TEXT     NOT NULL,
     year              SMALLINT NOT NULL,
     mean_temperature  SMALLINT,
@@ -49,108 +82,51 @@ CREATE TABLE gsod_availability (
     precipitation     SMALLINT,
     count             SMALLINT,
     PRIMARY KEY (station_id, year)
-);`
+)`
 
-func init() {
-	log.SetFlags(log.Ltime | log.Lshortfile)
-}
-
-var pgConn *pgx.ConnPool
-
-func connect() *pgx.ConnPool {
-	conn, err := pgx.NewConnPool(pgx.ConnPoolConfig{
-		ConnConfig: pgx.ConnConfig{
-			Database: "days",
-		},
-		MaxConnections: THREADS * 2,
-	})
+func saveGSOD(files chan File, dataDir string) {
+	conn, err := pgx.Connect(pgx.ConnConfig{Database: "days"})
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	return conn
-}
-func main() {
-	pgConn = connect()
-	defer pgConn.Close()
-	_, err := pgConn.Exec(ddl)
+	defer conn.Close()
+	tx, err := conn.Begin()
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-
-	var wg sync.WaitGroup
-	filesChan := make(chan File, 128)
-
-	for i := 0; i < THREADS; i++ {
-		wg.Add(1)
-		go worker(&wg, pgConn, filesChan)
+	_, err = tx.Exec(GSODTableSQL)
+	if err != nil {
+		log.Fatal(err)
 	}
-	getFiles(filesChan)
-	close(filesChan)
-	wg.Wait()
+	for file := range files {
+		saveStation(file, tx, dataDir)
+	}
+	err = tx.Commit()
+	if err != nil {
+		log.Fatal(err)
+	}
 }
-func getFiles(output chan File) {
-	walk := func(path string, info os.FileInfo, err error) error {
+
+var filenameRe = regexp.MustCompile(`^(\d{6}-\d{5})-(\d{4})\.op$`)
+
+func saveStation(file File, tx *pgx.Tx, dataDir string) {
+	match := filenameRe.FindStringSubmatch(file.name)
+	stationId := match[1]
+	lines := bytes.Split(file.data, []byte("\n"))
+	records := make([]*Line, 0, 400)
+	for _, line := range lines {
+		if len(line) == 0 || bytes.HasPrefix(line, []byte("STN--- WBAN")) {
+			continue
+		}
+		records = append(records, parseLine(line))
+	}
+	count := checkDataValid(tx, stationId, records)
+	if count > 350 {
+		err := ioutil.WriteFile(filepath.Join(dataDir, file.name), file.data, 0440)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
-		if strings.HasSuffix(path, ".tar") {
-			tarFile, err := os.Open(path)
-			if err != nil {
-				panic(err)
-			}
-			defer tarFile.Close()
-			tarReader := tar.NewReader(tarFile)
-			log.Println(path)
-			for {
-				header, err := tarReader.Next()
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					panic(err)
-				}
-				if !strings.HasSuffix(header.Name, "gz") {
-					continue
-				}
-				gzReader, err := gzip.NewReader(tarReader)
-				if err != nil {
-					panic(err)
-				}
-				data, err := ioutil.ReadAll(gzReader)
-				if err != nil {
-					panic(err)
-				}
-				output <- File{
-					name: header.Name,
-					data: data,
-				}
-			}
-		}
-		return nil
 	}
-	err := filepath.Walk(DATA_DIR, walk)
-	if err != nil {
-		panic(err)
-	}
-}
-func worker(wg *sync.WaitGroup, pool *pgx.ConnPool, files chan File) {
-	tx, err := pool.Begin()
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := recover(); err != nil {
-			panic(err)
-		}
-		err = tx.Commit()
-		if err != nil {
-			panic(err)
-		}
-	}()
-	for f := range files {
-		process(tx, f)
-	}
-	wg.Done()
 }
 
 type Line struct {
@@ -196,7 +172,7 @@ func checkNullAndConvert(value []byte, nullValue string, unit byte) interface{} 
 	}
 	v, err := strconv.ParseFloat(str, 64)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	switch unit {
 	case Fahrenheit:
@@ -213,34 +189,11 @@ func checkNullAndConvert(value []byte, nullValue string, unit byte) interface{} 
 	case Millibar:
 		return v * 100
 	}
-	panic("wrong unit")
+	log.Fatal("wrong unit")
+	return nil
 }
 
-type File struct {
-	name string
-	data []byte
-}
-
-var re = regexp.MustCompile(`(\d{6}-\d{5})-(\d{4})\.op\.gz`)
-
-func process(tx *pgx.Tx, file File) {
-	match := re.FindStringSubmatch(file.name)
-	stationId := match[1]
-	lines := bytes.Split(file.data, []byte("\n"))
-	records := make([]*Line, 0, 400)
-	for _, line := range lines {
-		if len(line) == 0 || bytes.HasPrefix(line, []byte("STN--- WBAN")) {
-			continue
-		}
-		records = append(records, parseLine(line))
-	}
-	checkDataValid(tx, stationId, records)
-	for _, record := range records {
-		insert(tx, stationId, record)
-	}
-}
-
-func checkDataValid(tx *pgx.Tx, stationId string, records []*Line) {
+func checkDataValid(tx *pgx.Tx, stationId string, records []*Line) int16 {
 	total := int16(len(records))
 	year := records[0].date[:4]
 	nilCount := make(map[string]int16)
@@ -267,21 +220,9 @@ func checkDataValid(tx *pgx.Tx, stationId string, records []*Line) {
 		availabilityValue.Elem().FieldByName(field).Set(reflect.ValueOf(total - nilCount[field]))
 	}
 	insertAvailability(tx, stationId, year, total, &availability)
+	return total
 }
 
-func insert(tx *pgx.Tx, stationId string, line *Line) {
-	sql := "INSERT INTO gsod (station_id, record_date, mean_temperature, " +
-		"max_temperature, min_temperature, mean_dew_point, mean_sea_pressure, " +
-		"mean_pressure, mean_visibility, mean_wind_speed, precipitation) " +
-		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
-	_, err := tx.Exec(sql, stationId, line.date, line.MeanTemperature, line.MaxTemperature,
-		line.MinTemperature, line.MeanDewPoint, line.MeanSeaPressure, line.MeanPressure,
-		line.MeanVisibility, line.MeanWindSpeed, line.Precipitation)
-	if err != nil {
-		log.Println(stationId, line.date)
-		panic(err)
-	}
-}
 func insertAvailability(tx *pgx.Tx, stationId string, year string, count int16, line *Line) {
 	sql := "INSERT INTO gsod_availability (station_id, year, count, mean_temperature, " +
 		"max_temperature, min_temperature, mean_dew_point, mean_sea_pressure, " +
@@ -291,6 +232,6 @@ func insertAvailability(tx *pgx.Tx, stationId string, year string, count int16, 
 		line.MinTemperature, line.MeanDewPoint, line.MeanSeaPressure, line.MeanPressure,
 		line.MeanVisibility, line.MeanWindSpeed, line.Precipitation)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 }

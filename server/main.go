@@ -19,7 +19,7 @@ FROM cities
     CROSS JOIN LATERAL (
         SELECT *, cities.coordinate <-> stations.coordinate AS distance FROM stations
             INNER JOIN gsod_availability ON stations.id = gsod_availability.station_id AND gsod_availability.year = $2
-                 AND gsod_availability.max_temperature > 350 AND gsod_availability.min_temperature > 350 AND gsod_availability.precipitation > 0
+                 AND gsod_availability.count > 350
             ORDER BY cities.coordinate <-> stations.coordinate LIMIT 8
         ) AS stations
     WHERE cities.alternate_names @> ('[{"name": "' || $1 || '"}]')::JSONB

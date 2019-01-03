@@ -2,78 +2,136 @@ package main
 
 import (
 	"archive/zip"
-	"github.com/jackc/pgx"
+	"bytes"
 	"io/ioutil"
 	"log"
 	"strings"
+
+	"github.com/crvv/days/import/utility"
+	"github.com/jackc/pgx"
 )
 
-// http://download.geonames.org/export/dump/cities5000.zip
-const CITIES_FILE = "data/cities5000.zip"
+const CitiesURL = "http://download.geonames.org/export/dump/cities5000.zip"
+const NamesURL = "http://download.geonames.org/export/dump/alternateNames.zip"
 
-// http://download.geonames.org/export/dump/alternateNames.zip
-const NAMES_FILE = "data/alternateNames.zip"
+type Name struct {
+	Names []AlternateName
+	Links []string
+}
 
-type AlternateNames struct {
+type AlternateName struct {
 	Name     string `json:"name"`
 	Language string `json:"language"`
 }
 
-func readNames() (names map[string][]AlternateNames, links map[string][]string) {
-	z, err := zip.OpenReader(NAMES_FILE)
+type City struct {
+	ID         string
+	Name       string
+	Latitude   string
+	Longitude  string
+	Elevation  string
+	Class      string
+	Country    string
+	Population string
+	Timezone   string
+}
+
+func main() {
+	citiesZip := utility.Download(CitiesURL)
+	namesZip := utility.Download(NamesURL)
+
+	log.Println("parse response")
+	cities := readCities(citiesZip)
+	names := readNames(namesZip)
+	log.Println("completed")
+
+	saveCities(cities, names)
+}
+
+func readZipFile(data []byte, filename string) []byte {
+	z, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	var f *zip.File
-	for _, f = range z.File {
-		if f.Name == "alternateNames.txt" {
-			break
+	for _, f := range z.File {
+		if f.Name == filename {
+			reader, err := f.Open()
+			if err != nil {
+				log.Fatal(err)
+			}
+			result, err := ioutil.ReadAll(reader)
+			if err != nil {
+				log.Fatal(err)
+			}
+			return result
 		}
 	}
-	reader, err := f.Open()
-	if err != nil {
-		panic(err)
-	}
-	namesData, err := ioutil.ReadAll(reader)
-	if err != nil {
-		panic(err)
-	}
-	lines := strings.Split(string(namesData), "\n")
-	names = make(map[string][]AlternateNames)
-	links = make(map[string][]string)
+	log.Fatalf("can't find %v in zip data", filename)
+	return nil
+}
+
+func readCities(data []byte) []City {
+	data = readZipFile(data, "cities5000.txt")
+	lines := bytes.Split(data, []byte("\n"))
+	cities := make([]City, 0, len(lines))
 	for _, line := range lines {
-		if line == "" {
+		if len(line) == 0 {
 			continue
 		}
-		fields := strings.Split(line, "\t")
+		fields := strings.Split(string(line), "\t")
+		var city City
+
+		city.ID = fields[0]
+		city.Name = fields[1]
+		city.Latitude = fields[4]
+		city.Longitude = fields[5]
+		city.Class = fields[6]
+		city.Country = fields[8]
+		city.Population = fields[14]
+		city.Elevation = fields[16]
+		city.Timezone = fields[17]
+		if city.Class != "P" {
+			log.Println(city)
+			continue
+		}
+
+		cities = append(cities, city)
+	}
+	return cities
+}
+
+func readNames(data []byte) map[string]Name {
+	data = readZipFile(data, "alternateNames.txt")
+	lines := bytes.Split(data, []byte("\n"))
+	names := make(map[string]Name)
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		fields := strings.Split(string(line), "\t")
+
 		id := fields[1]
 		language := fields[2]
-		name := fields[3]
+		nameStr := fields[3]
+		name := names[id]
+
 		if language == "link" {
-			links[id] = append(links[id], name)
+			name.Links = append(name.Links, nameStr)
 		} else {
-			names[id] = append(names[id], AlternateNames{
-				Name:     name,
+			name.Names = append(name.Names, AlternateName{
+				Name:     nameStr,
 				Language: language,
 			})
 		}
+		names[id] = name
 	}
-	return
+	return names
 }
-func main() {
-	names, links := readNames()
-	conn, err := pgx.Connect(pgx.ConnConfig{
-		Database: "days",
-	})
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-	tx, err := conn.Begin()
-	if err != nil {
-		panic(err)
-	}
-	_, err = tx.Exec(`CREATE TABLE cities (
+
+const CityTableSQL = `
+DROP TABLE IF EXISTS cities;
+
+CREATE TABLE cities (
     id              BIGINT PRIMARY KEY,
     station_id      TEXT,
     name            TEXT   NOT NULL,
@@ -83,68 +141,53 @@ func main() {
     coordinate      POINT,
     elevation       REAL   NOT NULL,
     population      BIGINT NOT NULL,
-    timezone        TEXT   NOT NULL)`)
-	if err != nil {
-		panic(err)
-	}
-	z, err := zip.OpenReader(CITIES_FILE)
-	if err != nil {
-		panic(err)
-	}
-	f, err := z.File[0].Open()
-	if err != nil {
-		panic(err)
-	}
-	log.Println(z.File[0].Name)
-	citiesData, err := ioutil.ReadAll(f)
-	if err != nil {
-		panic(err)
-	}
-	lines := strings.Split(string(citiesData), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		fields := strings.Split(line, "\t")
-		id := fields[0]
-		name := fields[1]
-		alternateNames := names[id]
-		link := links[id]
-		latitude := fields[4]
-		longitude := fields[5]
-		class := fields[6]
-		country := fields[8]
-		population := fields[14]
-		elevation := fields[16]
-		timezone := fields[17]
-		if class != "P" {
-			log.Println(class)
-			log.Println(id, name, alternateNames, country)
-			continue
-		}
-		insert(tx, id, name, latitude, longitude, country, population, elevation, timezone, alternateNames, link)
-	}
-	_, err = tx.Exec(`CREATE INDEX ON cities (station_id);
+    timezone        TEXT   NOT NULL);
+`
+
+const CityIndexSQL = `
+CREATE INDEX ON cities (station_id);
 CREATE INDEX ON cities (name);
 CREATE INDEX ON cities USING GIN (alternate_names jsonb_path_ops);
-CREATE INDEX ON cities USING GIST (coordinate);`)
+CREATE INDEX ON cities USING GIST (coordinate);
+`
+
+func saveCities(cities []City, names map[string]Name) {
+	conn, err := pgx.Connect(pgx.ConnConfig{Database: "days"})
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
+	defer conn.Close()
+	tx, err := conn.Begin()
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, err = tx.Exec(CityTableSQL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("created table")
+	for i, city := range cities {
+		name := names[city.ID]
+		sql := "INSERT INTO cities (id, name, link, alternate_names, coordinate, elevation, " +
+			"country, population, timezone) VALUES ($1, $2, $3, $4, point($5, $6), $7, $8, $9, $10)"
+		_, err := tx.Exec(sql, city.ID, city.Name, name.Links, name.Names,
+			city.Latitude, city.Longitude, city.Elevation,
+			city.Country, city.Population, city.Timezone)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if (i+1)%1000 == 0 {
+			log.Println("inserted", i+1, "cities")
+		}
+	}
+	log.Println("create index")
+	_, err = tx.Exec(CityIndexSQL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("commit")
 	err = tx.Commit()
 	if err != nil {
-		panic(err)
-	}
-}
-func insert(tx *pgx.Tx,
-	id, name, latitude, longitude, country, population, elevation, timezone string,
-	alternateNames []AlternateNames, link []string) {
-	sql := "INSERT INTO cities (id, name, link, alternate_names, coordinate, elevation, " +
-		"country, population, timezone) VALUES ($1, $2, $3, $4, point($5, $6), $7, $8, $9, $10)"
-	_, err := tx.Exec(sql, id, name, link, alternateNames, latitude, longitude, elevation,
-		country, population, timezone)
-	if err != nil {
-		log.Println(id, name, alternateNames, country)
-		panic(err)
+		log.Fatal(err)
 	}
 }
