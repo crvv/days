@@ -87,7 +87,7 @@ func writeResponse(w http.ResponseWriter, data []byte, err error) {
 		return
 	}
 	if bytes.Equal(data, []byte("null")) {
-		http.Error(w, "not found", http.StatusNotFound)
+		http.Error(w, "null", http.StatusNotFound)
 		return
 	}
 	_, err = w.Write(data)
